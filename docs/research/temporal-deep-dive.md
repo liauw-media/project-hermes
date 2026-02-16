@@ -1,5 +1,7 @@
 # Temporal.io Deep Dive: Cascade Engine Evaluation
 
+> **Context Note (2026-02-16):** This research is directly relevant to the current MVP. Temporal.io is the primary cascade engine for the aggregator-first architecture. The cascade workflow pattern documented here works identically whether downstream adapters are aggregator REST APIs (MVP) or direct SMPP connections (Phase 5+).
+
 ## Executive Summary
 
 Temporal.io is a durable execution platform that can replace the custom event-sourced cascade state machine identified as the weakest part of the Hermes architecture (scored 2/10 on state persistence by the system architect review). The key discovery: **Twilio runs every message through Temporal workflows** — proving this pattern works for messaging at scale.

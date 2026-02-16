@@ -1,144 +1,119 @@
-# Project Hermes: Next-Generation Architecture Plan
+# Project Hermes: Aggregator-First Implementation Plan
 
 > **Status:** PENDING TEAM APPROVAL
-> **Generated:** 2026-02-11
+> **Date:** 2026-02-16
+> **Revision:** 2.0 (Strategic Pivot from carrier-direct to aggregator-first)
 > **Scope:** Multi-tenant, multi-channel message delivery broker in Go
 
 ---
 
 ## Table of Contents
 
-1. [Context & Motivation](#context--motivation)
-2. [The Three Breakthroughs](#the-three-breakthroughs)
-3. [What This Eliminates](#what-this-eliminates)
-4. [Architecture Stack](#architecture-stack)
-5. [Project Structure](#project-structure)
-6. [Implementation Phases](#implementation-phases)
-7. [Key Technology Decisions](#key-technology-decisions)
-8. [What We're NOT Building (and Why)](#what-were-not-building-and-why)
-9. [Honest Timeline: 2-3 Devs + Claude](#honest-timeline-2-3-devs--claude)
-10. [Verification Plan](#verification-plan)
-11. [Expert Review Scores (Context)](#expert-review-scores-context)
-12. [Sources](#sources)
-13. [Decision Required](#decision-required)
+1. [Executive Summary](#executive-summary)
+2. [Strategic Decision: Aggregator-First](#strategic-decision-aggregator-first)
+3. [Architecture Stack](#architecture-stack)
+4. [Project Structure](#project-structure)
+5. [Implementation Phases](#implementation-phases)
+6. [Key Technology Decisions](#key-technology-decisions)
+7. [What We're NOT Building in MVP (and Why)](#what-were-not-building-in-mvp-and-why)
+8. [What We Preserve for Phase 2+](#what-we-preserve-for-phase-2)
+9. [Risk Register](#risk-register)
+10. [Team Allocation](#team-allocation)
+11. [Cost Analysis](#cost-analysis)
+12. [Decision Points for Team](#decision-points-for-team)
+13. [Sources](#sources)
 
 ---
 
-## Context & Motivation
+## Executive Summary
 
-Before writing any Go code, three research agents investigated modern technologies to determine whether the architecture should copy traditional 2010-era telecom patterns or leverage newer technology. The investigation covered: Temporal.io, Restate, Ergo Framework, WASM/Wazero, KumoMTA, actor models, CRDTs, edge computing, eBPF, and ML-based routing.
+Hermes is a **smart message broker**, not a telecom operator. The core product is **"One API to rule them all"** -- a unified API that accepts messages across channels (SMS, email, push, WhatsApp) and delivers them through intelligent cascade logic with automatic fallback, retry, and observability.
 
-**Key finding: Three technologies can eliminate 60-70% of the custom infrastructure code** that expert reviews (scoring 2/10 on state persistence, 2/10 on backpressure) identified as the hardest problems.
+For MVP, Hermes does **not** own the last mile. Third-party providers handle actual delivery:
 
-### Team Decisions Made During Planning
+- **SMS**: Telecom aggregators (Twilio, Vonage, Messente) handle carrier contracts, SMPP, routing, and compliance
+- **Email**: Amazon SES handles deliverability, IP reputation, DKIM signing, and bounce processing
+- **Push**: Firebase Cloud Messaging (FCM)
+- **WhatsApp**: Meta Cloud API
 
-| Decision Area       | Outcome                                                             |
-|---------------------|---------------------------------------------------------------------|
-| Philosophy          | Maximum Innovation                                                  |
-| Innovation Focus    | Carrier Connectivity                                                |
-| Cascade Engine      | Prototype both Temporal and Restate                                 |
-| Adapter Strategy    | Hybrid (WASM for REST adapters, Ergo actors for protocol adapters)  |
+What Hermes **does** own is the hard part that no single provider solves:
 
----
+- **Cascade engine** (durable execution via Temporal/Restate): if SMS fails, try email, then push -- automatically, reliably, surviving crashes
+- **Multi-tenant isolation**: API keys, rate limits, tenant-scoped routing
+- **9-layer validation pipeline**: auth, rate limiting, schema validation, content compliance, deduplication
+- **Smart routing**: provider selection based on tenant config, cost, and provider health
+- **Unified observability**: OpenTelemetry traces across the entire message lifecycle, regardless of downstream provider
+- **Provider abstraction via WASM adapters**: hot-swappable, sandboxed plugins for each provider
 
-## The Three Breakthroughs
+**Scale target:** 22M messages/day (2B texts + 6B emails/year).
 
-### 1. Temporal.io / Restate = Cascade Engine
-
-Twilio literally runs every message through Temporal. The cascade engine (scored 2/10 on state persistence by architect review) is a solved problem via durable execution.
-
-|                      | Temporal.io                                          | Restate                                              |
-|----------------------|------------------------------------------------------|------------------------------------------------------|
-| **Scale proof**      | Twilio, Netflix, Snap, Instacart (75M/month)         | 94K actions/sec benchmarked                          |
-| **Per-step latency** | 50-150ms (regular), 10-30ms (local activity)         | 3ms (low load), 10ms (high load)                     |
-| **Go SDK**           | Mature (v1.31+), first-class                         | New (late 2025), functional                          |
-| **Persistence**      | Cassandra/PostgreSQL/MySQL                           | Built-in RocksDB (no external DB)                    |
-| **Operations**       | Heavy (cluster + DB + ES)                            | Light (single Rust binary)                           |
-| **Cascade fit**      | Workflow = cascade, Activity = send, Signal = DLR    | Virtual Object per message, awakeable = DLR          |
-| **At 22M/day**       | Proven (Twilio does more)                            | Needs validation at this scale                       |
-| **Self-hosted cost** | $5K-10K/mo infra + DevOps                            | Lower (single binary)                                |
-| **Cloud cost**       | $132K-540K/mo (disqualified)                         | No cloud offering yet                                |
-
-**Hybrid recommended:** Temporal for cascade orchestration + NATS JetStream for high-throughput delivery transport. Activities publish to NATS (sub-ms), NATS consumers handle actual provider delivery. DLR webhooks signal back to Temporal workflows.
+This plan delivers a **working, demoable, multi-tenant MVP in 4 weeks** with 3 developers + Claude. Carrier-direct connections and own MTA infrastructure are deferred to Phase 5+ as business decisions driven by margin optimization.
 
 ---
 
-### 2. Ergo Framework = Carrier Mesh
+## Strategic Decision: Aggregator-First
 
-Ergo v3.2.0 (Feb 2026) brings genuine OTP patterns ported to Go with 21M msg/sec:
+### Why This Approach
 
-- **gen.Server** -- stateful actor (each SMPP connection)
-- **gen.Supervisor** -- auto-restart with 4 strategies (OFO/AFO/RFO/SOFO)
-- **gen.Stage** -- demand-driven backpressure (from Elixir's GenStage)
-- **gen.Saga** -- distributed transactions with recovery
-- **Meta Processes (TCP)** -- bridge blocking SMPP I/O with actor messaging
-- Zero dependencies, 4.4K stars, MIT, actively maintained
+The previous implementation plan (v1.0, 2026-02-11) targeted carrier-direct from day one: SMPP connections via Ergo actor mesh, KumoMTA for email, gosmpp fork, HLR lookups. Expert reviews scored this approach 4/10 on feasibility and called the timeline "fiction."
 
-#### Carrier Mesh Supervision Tree
+Colleague feedback (Feb 2026) crystallized the pivot:
+
+| Factor | Carrier-Direct MVP | Aggregator-First MVP |
+|--------|-------------------|---------------------|
+| **Time to market** | 20+ weeks | 4 weeks |
+| **Carrier contracts** | 3-6 months to negotiate | Not needed |
+| **SMPP expertise required** | Yes (team has none) | No |
+| **IP warming for email** | 8 weeks minimum | SES handles it |
+| **Danish telecom registration** | Criminal offense blocker | Aggregators are registered |
+| **Infrastructure complexity** | SMPP mesh + MTA + HLR | REST API calls to providers |
+| **First PoC customers** | 6-9 months | 4-8 weeks |
+| **Margins still viable?** | Higher (eventually) | Yes (see Cost Analysis) |
+
+The core product value is in the **cascade engine, multi-tenancy, and unified API** -- not in owning SMPP connections. Aggregators commoditize the last mile. Hermes commoditizes the orchestration layer on top.
+
+### What Aggregators Provide
+
+SMS aggregators (Twilio, Vonage, Messente, etc.) handle:
+
+- Carrier contracts and relationships
+- SMPP protocol connections to carriers
+- Number routing and porting databases (HLR/MNP)
+- Delivery receipt (DLR) processing and normalization
+- Compliance (TCPA, GDPR opt-out lists)
+- Number provisioning and sender ID management
+- Throughput scaling (no per-carrier window management)
+
+### What Amazon SES Provides
+
+- Deliverability optimization (shared and dedicated IPs)
+- IP reputation management and warming
+- DKIM signing (user provides DNS records)
+- SPF and DMARC alignment
+- Bounce and complaint handling
+- ISP feedback loops
+- Sending statistics and deliverability dashboards
+- Up to 50,000 emails/second per account (with limit increase)
+
+Users set up their own DNS (SPF/DKIM/DMARC records). SES provides the verification flow and signing keys. This is standard practice -- every SES-based platform works this way.
+
+### Path to Carrier-Direct (Phase 5+)
+
+Carrier-direct connections become a **business decision**, not a technical prerequisite:
 
 ```
-SMPPSupervisor (gen.Supervisor, One-For-One)
-├── CarrierSupervisor("telia-dk", gen.Supervisor)
-│   ├── ConnectionActor (gen.Server + TCP Meta Process)
-│   │   └── owns gosmpp session, TLS wrapper, window tracker
-│   ├── ConnectionActor (gen.Server + TCP Meta Process)
-│   └── DLRProcessor (gen.Server, correlates carrier→internal IDs)
-├── CarrierSupervisor("tdc", gen.Supervisor)
-│   └── ConnectionActor ...
-├── HealthAggregator (gen.Server, publishes mesh health)
-└── BackpressureManager (gen.Stage, demand-driven flow control)
+Trigger: Margins on aggregator SMS < X% (e.g., Twilio takes $0.0075/SMS, carrier-direct costs $0.001-0.003)
+         AND monthly SMS volume > Y million (where carrier contracts make economic sense)
+         AND team has built operational expertise with the platform
+
+Action:  Implement Ergo actor mesh for SMPP (all research is done, architecture supports it)
+         Swap aggregator WASM adapter -> SMPP actor adapter at the port interface level
+         Keep aggregator as fallback path
+
+Same logic applies to email: SES costs $0.10/1000 -> KumoMTA is effectively free at scale
 ```
 
-**Why this beats connection pools:** supervisor auto-restarts, gen.Stage backpressure, actor-local state (no locks), mailbox depth as load signal, escalation on N restarts.
-
----
-
-### 3. WASM/Wazero + KumoMTA
-
-**Wazero:** production-ready (Arcjet: p50=10ms, p99=30ms), zero dependencies, ~57ns function call overhead, deny-by-default sandboxing.
-
-**KumoMTA:** Rust-based open-source MTA, 7M+ messages/hour per node, Lua scripting config. ISP throttling, IP warming, bounce handling, DKIM built in. Apache 2 licensed.
-
-#### WASM Adapter Interfaces
-
-```go
-// AdapterHost -- functions the host exposes to WASM plugins
-type AdapterHost interface {
-    SendHTTP(url string, headers map[string]string, body []byte) ([]byte, error)
-    Log(level string, msg string)
-    EmitMetric(name string, value float64)
-    GetConfig(key string) string
-    StoreGet(key string) []byte
-    StoreSet(key string, value []byte)
-}
-
-// AdapterPlugin -- functions each WASM adapter must implement
-type AdapterPlugin interface {
-    OnMessage(msg []byte) ([]byte, error)
-    OnDeliveryReport(report []byte) ([]byte, error)
-    OnConfigure(config []byte) error
-    OnHealthCheck() bool
-}
-```
-
-**Hybrid adapter strategy:** WASM for stateless HTTP (SendGrid, Twilio REST, FCM, WhatsApp Cloud API), Ergo actors for stateful protocols (SMPP, SMTP/MTA).
-
----
-
-## What This Eliminates
-
-| Traditional Approach                                   | Next-Gen Replacement                     | Lines Saved               |
-|--------------------------------------------------------|------------------------------------------|---------------------------|
-| Custom event-sourced cascade state machine             | Temporal/Restate workflow                | ~3,000-5,000              |
-| NATS KV for cascade state (won't scale to 153M keys)  | Temporal/Restate persistence             | Problem disappears        |
-| Pod crash = message in quantum state                   | Durable execution guarantee              | Recovery code gone        |
-| Docker + gRPC + Ed25519 + heartbeats for adapters      | WASM plugins via Wazero                  | ~2,000                    |
-| Connection pool manager + health check polling         | Ergo supervision tree                    | ~1,500                    |
-| Custom backpressure chain (5 layers)                   | gen.Stage + Temporal rate limiting        | 3 of 5 layers natural     |
-| Manual DLR correlation store                           | Actor-local in DLRProcessor              | Simpler                   |
-| Build own MTA from scratch                             | KumoMTA (Lua-configured)                 | Entire MTA codebase       |
-| Custom IP warming scheduler                            | KumoMTA built-in                         | ~500                      |
-| Custom bounce classification                           | KumoMTA built-in                         | ~1,000                    |
+The hexagonal architecture means this swap is a **port adapter change**, not a rewrite. The cascade engine, validation pipeline, router, and tenant management are provider-agnostic by design.
 
 ---
 
@@ -146,88 +121,102 @@ type AdapterPlugin interface {
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                           INBOUND PROTOCOL GATEWAY                              │
+│                              INBOUND API GATEWAY                                │
 │                                                                                 │
+│   ┌──────────────────┐                    ┌──────────────────┐                  │
+│   │     REST API      │                    │    Webhooks       │                  │
+│   │  POST /v1/messages│                    │  (DLR / Status)   │                  │
+│   │  GET  /v1/status  │                    │  Provider callbacks│                  │
+│   │  (Chi router)     │                    │  (per-provider)    │                  │
+│   └────────┬─────────┘                    └────────┬──────────┘                  │
+│            │                                        │                            │
+│            └──────────────┬─────────────────────────┘                            │
+│                           │                                                      │
+│               Unified Message Normalization                                      │
+└───────────────────────────┬──────────────────────────────────────────────────────┘
+                            │
+┌───────────────────────────┴──────────────────────────────────────────────────────┐
+│                      VALIDATION PIPELINE (9 layers)                              │
+│                                                                                  │
+│   Auth → Tenant → Schema → Content → Compliance → DNC → Rate → Dedup → Enrich  │
+└───────────────────────────┬──────────────────────────────────────────────────────┘
+                            │
+┌───────────────────────────┴──────────────────────────────────────────────────────┐
+│                 CASCADE ENGINE (Temporal.io / Restate)                            │
+│                                                                                  │
+│   ┌───────────────────────────────────────────────────────────────────────────┐  │
+│   │  CascadeWorkflow (one per message)                                        │  │
+│   │                                                                           │  │
+│   │  ┌───────────┐     ┌───────────┐     ┌───────────┐     ┌───────────┐    │  │
+│   │  │ Channel 1 │────→│ Channel 2 │────→│ Channel 3 │────→│ Exhaust / │    │  │
+│   │  │   (SMS)   │     │  (Email)  │     │  (Push)   │     │  Notify   │    │  │
+│   │  └─────┬─────┘     └─────┬─────┘     └─────┬─────┘     └───────────┘    │  │
+│   │        │                 │                 │                              │  │
+│   │   Wait for DLR      Wait for DLR      Wait for DLR                      │  │
+│   │   (Signal/Timer)    (Signal/Timer)    (Signal/Timer)                     │  │
+│   │                                                                           │  │
+│   │  Durable state  |  Timer-based fallback  |  Crash recovery automatic     │  │
+│   └───────────────────────────────────────────────────────────────────────────┘  │
+└───────────────────────────┬──────────────────────────────────────────────────────┘
+                            │
+┌───────────────────────────┴──────────────────────────────────────────────────────┐
+│                            SMART ROUTER                                          │
+│                                                                                  │
+│   Tenant config → Provider health → Cost optimization → Provider selection       │
+│   (embedded library, no network hop)                                             │
+└───────────────────────────┬──────────────────────────────────────────────────────┘
+                            │
+                      NATS JetStream
+                    (delivery stream)
+                            │
+┌───────────────────────────┴──────────────────────────────────────────────────────┐
+│                   PROVIDER ADAPTERS (WASM / Wazero)                              │
+│                                                                                  │
 │   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐       │
-│   │   REST API   │  │ SMPP Server  │  │ SMTP Server  │  │  Webhooks    │       │
-│   │  (net/http)  │  │   (gosmpp)   │  │  (go-smtp)   │  │  (DLR/MO)   │       │
-│   └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘       │
-│          └─────────────────┴─────────────────┴─────────────────┘               │
-│                                    │                                            │
-│                        Unified Message Normalization                            │
-└────────────────────────────────────┬────────────────────────────────────────────┘
-                                     │
-┌────────────────────────────────────┴────────────────────────────────────────────┐
-│                          VALIDATION PIPELINE (9 layers)                         │
-│                                                                                 │
-│   Auth → Tenant → Schema → Content → Compliance → DNC → Rate → Dedup → Enrich │
-└────────────────────────────────────┬────────────────────────────────────────────┘
-                                     │
-┌────────────────────────────────────┴────────────────────────────────────────────┐
-│                     CASCADE ENGINE (Temporal or Restate)                        │
-│                                                                                 │
-│   ┌─────────────────────────────────────────────────────────────────────┐       │
-│   │  CascadeWorkflow                                                    │       │
-│   │  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐        │       │
-│   │  │ Channel 1│──→│ Channel 2│──→│ Channel 3│──→│ Fallback │        │       │
-│   │  │  (SMS)   │   │ (Email)  │   │  (Push)  │   │ (Notify) │        │       │
-│   │  └──────────┘   └──────────┘   └──────────┘   └──────────┘        │       │
-│   │                                                                     │       │
-│   │  Durable state  |  Timer-based fallback  |  DLR signal handling    │       │
-│   └─────────────────────────────────────────────────────────────────────┘       │
-└────────────────────────────────────┬────────────────────────────────────────────┘
-                                     │
-┌────────────────────────────────────┴────────────────────────────────────────────┐
-│                              SMART ROUTER                                       │
-│                                                                                 │
-│   Route Selection: Carrier capacity → HLR cache → Cost optimization            │
-│   Embedded library (no network hop)                                             │
-└────────────────────────────────────┬────────────────────────────────────────────┘
-                                     │
-                    ┌────────────────┴────────────────┐
-                    │                                  │
-┌───────────────────┴──────────────────┐  ┌───────────┴──────────────────────────┐
-│        CARRIER MESH (Ergo)           │  │       WASM ADAPTER LAYER (Wazero)    │
-│                                      │  │                                      │
-│  ┌────────────────────────────────┐  │  │  ┌──────────┐  ┌──────────────────┐  │
-│  │ SMPPSupervisor                 │  │  │  │ SendGrid │  │ Twilio REST API  │  │
-│  │  ├── CarrierSupervisor(telia)  │  │  │  │  (.wasm) │  │     (.wasm)      │  │
-│  │  │    ├── ConnectionActor x N  │  │  │  └──────────┘  └──────────────────┘  │
-│  │  │    └── DLRProcessor         │  │  │  ┌──────────┐  ┌──────────────────┐  │
-│  │  ├── CarrierSupervisor(tdc)    │  │  │  │   FCM    │  │ WhatsApp Cloud   │  │
-│  │  ├── HealthAggregator          │  │  │  │  (.wasm) │  │     (.wasm)      │  │
-│  │  └── BackpressureManager       │  │  │  └──────────┘  └──────────────────┘  │
-│  └────────────────────────────────┘  │  │                                      │
-│                                      │  │  Hot-swap | Sandboxed | Metered      │
-│  Stateful SMPP/TCP connections       │  │  Stateless HTTP adapters             │
-└──────────────────────────────────────┘  └──────────────────────────────────────┘
-                    │                                  │
-                    └────────────────┬────────────────┘
-                                     │
-┌────────────────────────────────────┴────────────────────────────────────────────┐
-│                        EMAIL DELIVERY (KumoMTA)                                 │
-│                                                                                 │
-│   Lua-configured  |  ISP throttling  |  IP warming  |  DKIM/SPF/DMARC          │
-│   Bounce handling |  7M+ msg/hr/node |  Apache 2.0                              │
-└────────────────────────────────────┬────────────────────────────────────────────┘
-                                     │
-┌────────────────────────────────────┴────────────────────────────────────────────┐
-│                            INFRASTRUCTURE                                       │
-│                                                                                 │
-│   ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐        │
-│   │PostgreSQL│  │   NATS   │  │  Redis   │  │  Vault   │  │ KumoMTA  │        │
-│   │ (tenant, │  │JetStream │  │ (HLR,   │  │(secrets, │  │  (email  │        │
-│   │  config) │  │(delivery)│  │  cache)  │  │  creds)  │  │  relay)  │        │
-│   └──────────┘  └──────────┘  └──────────┘  └──────────┘  └──────────┘        │
-└────────────────────────────────────┬────────────────────────────────────────────┘
-                                     │
-┌────────────────────────────────────┴────────────────────────────────────────────┐
-│                           OBSERVABILITY                                         │
-│                                                                                 │
-│   OpenTelemetry Traces  |  Prometheus Metrics  |  Grafana Dashboards            │
-│   ~45 metrics           |  ~30 alerts          |  Distributed tracing           │
-└─────────────────────────────────────────────────────────────────────────────────┘
+│   │ Twilio SMS   │  │ Amazon SES   │  │   FCM Push   │  │  WhatsApp    │       │
+│   │   (.wasm)    │  │   (.wasm)    │  │   (.wasm)    │  │ Cloud API    │       │
+│   │              │  │              │  │              │  │   (.wasm)    │       │
+│   │ REST API     │  │ AWS SDK      │  │ REST API     │  │ REST API     │       │
+│   └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘       │
+│                                                                                  │
+│   ┌──────────────┐  ┌──────────────┐                                            │
+│   │ Vonage SMS   │  │ Messente SMS │    Hot-swap  |  Sandboxed  |  Metered      │
+│   │   (.wasm)    │  │   (.wasm)    │                                            │
+│   └──────────────┘  └──────────────┘                                            │
+└───────────────────────────┬──────────────────────────────────────────────────────┘
+                            │
+                    DLR / Status Webhooks
+                    (callbacks from providers)
+                            │
+                    Temporal Signal → Update cascade state
+                            │
+                    Tenant webhook notification
+                            │
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                            INFRASTRUCTURE                                        │
+│                                                                                  │
+│   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐       │
+│   │  PostgreSQL  │  │     NATS     │  │    Redis     │  │   Temporal   │       │
+│   │  (tenants,   │  │  JetStream   │  │  (cache,     │  │   Server     │       │
+│   │  config,     │  │  (delivery   │  │   rate       │  │  (cascade    │       │
+│   │  routing)    │  │   transport) │  │   limits)    │  │   state)     │       │
+│   └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘       │
+└──────────────────────────────────────────────────────────────────────────────────┘
+                            │
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                           OBSERVABILITY                                          │
+│                                                                                  │
+│   OpenTelemetry Traces  |  Prometheus Metrics  |  Grafana Dashboards             │
+│   End-to-end message tracing across cascade steps and provider calls             │
+└──────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+### Key Architecture Principles
+
+1. **Hexagonal (Ports & Adapters):** Domain core (cascade, routing, validation) knows nothing about providers. Provider adapters implement port interfaces. Swapping Twilio for SMPP-direct is an adapter change.
+2. **Durable Execution:** Temporal/Restate guarantees every message completes its cascade -- even through crashes, restarts, and network partitions.
+3. **WASM Sandboxing:** Provider adapters run in Wazero with deny-by-default permissions. A buggy adapter cannot crash the host or access other tenants' data.
+4. **NATS JetStream as Transport:** Decouples cascade engine from delivery. Activities publish to NATS (sub-ms), NATS consumers drive adapter execution. Provides backpressure and persistence.
 
 ---
 
@@ -236,39 +225,118 @@ type AdapterPlugin interface {
 ```
 hermes/
 ├── cmd/
-│   ├── hermes-api/              # REST API server
-│   ├── hermes-cascade/          # Cascade engine workers
-│   ├── hermes-smpp/             # SMPP Connection Manager (Ergo)
-│   └── hermes-gateway/          # Protocol Gateway
+│   ├── hermes-api/                  # REST API server (Chi router)
+│   └── hermes-cascade/              # Cascade engine workers (Temporal)
+│
 ├── internal/
-│   ├── domain/                  # Core domain types
-│   ├── ports/                   # Port interfaces
-│   ├── cascade/                 # Cascade engine (Temporal/Restate)
-│   ├── router/                  # Smart Router (embedded library)
-│   ├── carrier/                 # Carrier Mesh (Ergo actors)
-│   ├── gateway/                 # Protocol Gateway (REST, SMPP, SMTP)
+│   ├── domain/                      # Core domain types
+│   │   ├── message.go               #   Message, Channel, Priority
+│   │   ├── tenant.go                #   Tenant, TenantConfig, APIKey
+│   │   ├── cascade.go               #   CascadeRule, CascadeStep, CascadeStatus
+│   │   ├── provider.go              #   Provider, ProviderConfig, ProviderHealth
+│   │   └── delivery.go              #   DeliveryReport, DeliveryStatus
+│   │
+│   ├── ports/                       # Port interfaces (hexagonal boundaries)
+│   │   ├── message_port.go          #   MessageSubmitter, MessageQuerier
+│   │   ├── cascade_port.go          #   CascadeExecutor, CascadeQuerier
+│   │   ├── provider_port.go         #   ProviderAdapter, ProviderHealthChecker
+│   │   ├── router_port.go           #   Router, RouteSelector
+│   │   ├── tenant_port.go           #   TenantRepository, TenantAuthenticator
+│   │   └── notification_port.go     #   WebhookNotifier
+│   │
+│   ├── cascade/                     # Cascade engine implementation
+│   │   ├── workflow.go              #   CascadeWorkflow (Temporal)
+│   │   ├── activities.go            #   SendMessage, NotifyTenant activities
+│   │   └── signals.go               #   DLR signal handler
+│   │
+│   ├── router/                      # Smart Router
+│   │   ├── router.go                #   Route selection logic
+│   │   ├── cost.go                  #   Cost-based provider ranking
+│   │   └── health.go                #   Provider health tracking
+│   │
 │   ├── adapters/
-│   │   ├── wasm/                # WASM adapter host (Wazero)
-│   │   ├── sendgrid/            # SendGrid WASM adapter
-│   │   ├── twilio/              # Twilio WASM adapter
-│   │   └── smpp/                # SMPP adapter (Ergo + gosmpp)
-│   ├── security/                # TenantSecurityContext, auth, TLS
-│   ├── validation/              # 9-layer validation pipeline
-│   └── infra/                   # Database, NATS, Redis, Vault
+│   │   ├── wasm/                    # WASM adapter host (Wazero)
+│   │   │   ├── host.go              #     Host functions (SendHTTP, Log, etc.)
+│   │   │   ├── loader.go            #     WASM module loader + hot-swap
+│   │   │   └── sandbox.go           #     Permission enforcement
+│   │   └── webhook/                 # DLR/status webhook receiver
+│   │       ├── handler.go           #     Per-provider webhook parsing
+│   │       └── dispatcher.go        #     Route DLR to Temporal Signal
+│   │
+│   ├── security/                    # Auth and tenant context
+│   │   ├── apikey.go                #   API key validation
+│   │   ├── tenant_context.go        #   Request-scoped tenant context
+│   │   └── middleware.go            #   Auth middleware
+│   │
+│   ├── validation/                  # 9-layer validation pipeline
+│   │   ├── pipeline.go              #   Pipeline orchestrator
+│   │   ├── auth.go                  #   Authentication validator
+│   │   ├── tenant.go                #   Tenant status validator
+│   │   ├── schema.go                #   Message schema validator
+│   │   ├── content.go               #   Content policy validator
+│   │   ├── compliance.go            #   Regulatory compliance
+│   │   ├── dnc.go                   #   Do-Not-Contact list check
+│   │   ├── ratelimit.go             #   Rate limit enforcer
+│   │   ├── dedup.go                 #   Deduplication (idempotency)
+│   │   └── enrich.go                #   Message enrichment
+│   │
+│   └── infra/                       # Infrastructure adapters
+│       ├── postgres/                #   PostgreSQL repositories
+│       ├── nats/                    #   NATS JetStream client
+│       ├── redis/                   #   Redis cache client
+│       └── temporal/                #   Temporal client setup
+│
 ├── pkg/
-│   ├── smpp/                    # Hardened gosmpp fork wrapper
-│   ├── errors/                  # Error Taxonomy
-│   └── observability/           # OpenTelemetry setup
-├── adapters/                    # WASM adapter source -> .wasm
-│   ├── sendgrid/
-│   └── twilio/
+│   ├── errors/                      # Error taxonomy (domain errors)
+│   │   └── errors.go
+│   └── observability/               # OpenTelemetry setup
+│       ├── tracing.go
+│       └── metrics.go
+│
+├── adapters/                        # WASM adapter source code
+│   ├── twilio/                      #   Twilio SMS adapter
+│   │   ├── main.go                  #     TinyGo source
+│   │   └── twilio.wasm              #     Compiled WASM module
+│   ├── vonage/                      #   Vonage SMS adapter
+│   ├── messente/                    #   Messente SMS adapter
+│   ├── ses/                         #   Amazon SES email adapter
+│   ├── fcm/                         #   Firebase Cloud Messaging adapter
+│   └── whatsapp/                    #   WhatsApp Cloud API adapter
+│
 ├── deploy/
-│   ├── docker/                  # Docker Compose
-│   ├── k8s/                     # Kubernetes manifests
-│   ├── terraform/               # IaC
-│   └── kumomta/                 # KumoMTA Lua config
-└── docs/
+│   └── docker/                      # Docker Compose (dev + demo)
+│       ├── docker-compose.yml       #   PG, NATS, Redis, Temporal, Grafana
+│       └── docker-compose.prod.yml  #   Production overrides
+│
+├── docs/
+│   ├── adr/                         # Architecture Decision Records
+│   ├── plans/                       # This file
+│   ├── research/                    # Technology research (Temporal, Ergo, WASM, etc.)
+│   └── reviews/                     # Expert review findings
+│
+├── scripts/
+│   ├── seed-tenant.sh               # Create test tenant + API key
+│   └── load-test.sh                 # k6 or vegeta load test
+│
+├── go.mod
+├── go.sum
+├── Makefile
+└── README.md
 ```
+
+### What Changed from v1.0
+
+| Removed | Reason |
+|---------|--------|
+| `cmd/hermes-smpp/` | No SMPP connections in MVP |
+| `cmd/hermes-gateway/` | No SMPP/SMTP inbound in MVP; REST-only |
+| `internal/carrier/` | No Ergo actor mesh in MVP |
+| `internal/gateway/` | No multi-protocol gateway in MVP |
+| `internal/adapters/smpp/` | No SMPP adapter in MVP |
+| `pkg/smpp/` | No gosmpp fork in MVP |
+| `deploy/k8s/` | Kubernetes deferred to Phase 4 |
+| `deploy/terraform/` | Terraform deferred to Phase 4 |
+| `deploy/kumomta/` | No KumoMTA in MVP |
 
 ---
 
@@ -276,206 +344,250 @@ hermes/
 
 ### Phase 0: Foundation (Week 1)
 
-Go workspace, CI, tooling, domain types, port interfaces, error taxonomy, Docker Compose (PostgreSQL, NATS, Redis, Temporal/Restate).
+**Goal:** Buildable Go workspace with infrastructure running and domain model defined.
 
-**Exit criteria:** `go build ./...` passes, Docker Compose up, domain types compile, CI green.
+| Task | Description | Owner |
+|------|-------------|-------|
+| Go workspace init | `go mod init`, directory structure, Makefile | Dev 1 |
+| Docker Compose | PostgreSQL 16, NATS 2.10+, Redis 7, Temporal Server | Dev 3 |
+| CI pipeline | GitHub Actions: lint, test, build | Dev 3 |
+| Domain types | `Message`, `Tenant`, `CascadeRule`, `Channel`, `Provider`, `DeliveryReport` | Dev 1 |
+| Port interfaces | All port interfaces in `internal/ports/` | Dev 1 |
+| Error taxonomy | Structured error types with codes | Dev 2 |
+| PostgreSQL schema | Tenants, provider configs, message log tables | Dev 2 |
+| NATS streams | JetStream stream definitions for delivery | Dev 2 |
+| Basic README | Setup instructions, architecture overview | Claude |
 
----
+**Exit Criteria:**
 
-### Phase 1: Cascade Engine Prototypes (Weeks 2-4)
-
-- **Temporal prototype:** CascadeWorkflow, SendMessageActivity, DLR signal handler, timer timeout
-- **Restate prototype:** Virtual Object, durable RPC, awakeable
-- **Shared:** NATS JetStream streams, webhook DLR endpoint, REST API
-- **Comparison criteria:** code simplicity, latency (OTel), crash recovery, operational complexity, debugging
-
-**Deliverable:** `POST /v1/messages` triggers cascade across 3 channels with simulated DLR and crash recovery.
-
----
-
-### Phase 2: Carrier Mesh + SMPP (Weeks 5-8)
-
-- Fork gosmpp, add TLS wrapping, PDU validation, fuzz testing
-- Ergo actors: ConnectionActor, CarrierSupervisor, SMPPSupervisor, WindowTracker, DLRProcessor, HealthAggregator, BackpressureManager
-- SMPP simulator testing
-- Smart Router: capacity queries, HLR cache, least-cost routing
-
-**Deliverable:** Route SMS through actor mesh to SMPP simulator. Supervisor auto-restart on failure. Backpressure under load.
+- `go build ./...` passes with no errors
+- `docker compose up` brings up PG, NATS, Redis, Temporal
+- CI pipeline green on main branch
+- Domain types and port interfaces compile and have godoc comments
 
 ---
 
-### Phase 3: WASM Adapters + Protocol Gateway (Weeks 9-12)
+### Phase 1: Cascade Engine + API (Week 2)
 
-- Wazero host: SendHTTP, Log, EmitMetric, GetConfig, StoreGet/Set
-- go-plugin protobuf interface, hot-swap lifecycle
-- Adapters: SendGrid, Twilio, WhatsApp Cloud API, FCM
-- Protocol Gateway: SMPP server (inbound), SMTP server, unified message normalization
+**Goal:** End-to-end message flow from API to cascade with simulated providers.
 
-**Deliverable:** REST/SMPP/SMTP inbound. Multi-channel cascade. Hot-swap WASM adapters at runtime.
+| Task | Description | Owner |
+|------|-------------|-------|
+| REST API | `POST /v1/messages`, `GET /v1/messages/{id}`, Chi router, JSON validation | Dev 2 |
+| Validation pipeline | Auth + Rate + Schema layers (3 of 9 layers) | Dev 2 |
+| CascadeWorkflow | Temporal workflow: 3-step cascade with timer-based fallback | Dev 1 |
+| SendMessage activity | Publishes to NATS JetStream, NATS consumer invokes mock provider | Dev 1 |
+| DLR webhook endpoint | Receives provider callbacks, dispatches Temporal Signal | Dev 1 |
+| Mock providers | HTTP server simulating Twilio/SES/FCM responses + DLR callbacks | Dev 3 |
+| NATS delivery consumer | Consumes from JetStream, calls provider adapter, publishes result | Dev 3 |
+| Integration tests | Full cascade test: submit -> cascade 3 channels -> DLR -> complete | Claude |
+
+**Exit Criteria:**
+
+- `POST /v1/messages` triggers a 3-channel cascade
+- Each cascade step waits for DLR, times out, and falls through to next channel
+- DLR webhook signals Temporal workflow to mark delivery successful
+- Message survives worker crash mid-cascade (kill worker, restart, cascade resumes)
+- `GET /v1/messages/{id}` returns current cascade status
 
 ---
 
-### Phase 4: KumoMTA + Email (Weeks 13-16)
+### Phase 2: Provider Adapters + Real Integration (Week 3)
 
-- KumoMTA deployment and Lua config (ISP throttling, DKIM, SPF/DMARC, bounce)
-- MTASupervisor: IPPoolManager, BounceProcessor, HealthMonitor
-- IP warming begins (8-week process)
+**Goal:** Real messages sent through real providers via WASM adapters.
 
-**Deliverable:** Email delivery via KumoMTA with DKIM/SPF. IP warming underway.
+| Task | Description | Owner |
+|------|-------------|-------|
+| WASM host (Wazero) | `SendHTTP`, `Log`, `EmitMetric`, `GetConfig` host functions | Dev 1 |
+| WASM loader | Module loading, hot-swap lifecycle, version tracking | Dev 1 |
+| Twilio SMS adapter | TinyGo WASM: format Twilio API request, parse response/DLR | Dev 3 |
+| Amazon SES adapter | Native Go adapter (AWS SDK v2 uses reflection, incompatible with TinyGo/WASM). Implements same `ProviderAdapter` port interface. Migrate to WASM if TinyGo support improves. | Dev 3 |
+| FCM push adapter | TinyGo WASM: format FCM v1 API request, parse response | Claude |
+| Smart Router (basic) | Tenant config -> channel -> provider selection | Dev 2 |
+| Provider health tracking | Track success/failure rates per provider, circuit breaker | Dev 2 |
+| Sandbox testing | Twilio test credentials, SES sandbox, FCM test project | Dev 3 |
+| Adapter unit tests | Test each WASM adapter with recorded HTTP responses | Claude |
+
+**Exit Criteria:**
+
+- Real SMS sent via Twilio (test credentials / sandbox)
+- Real email sent via Amazon SES (sandbox mode)
+- Real push notification via FCM (test project)
+- WASM adapters load, execute, and hot-swap without host restart
+- Sandbox enforcement verified (WASM cannot access filesystem or arbitrary network)
+- Smart Router selects provider based on tenant config
 
 ---
 
-### Phase 5: Security + Production Hardening (Weeks 17-20)
+### Phase 3: Multi-Tenancy + Hardening (Week 4)
 
-- **Secrets:** HashiCorp Vault (carrier creds, DKIM keys, HLR tokens, API key encryption)
-- **Security:** TLS everywhere, PDU fuzz hardening, multi-protocol auth unification
-- **Abuse prevention:** MTA abuse rules, network segmentation
-- **Observability:** OpenTelemetry traces, Prometheus metrics, Grafana dashboards, alerting (~45 metrics, ~30 alerts)
-- **Multi-tenancy:** Sandbox environment, rate limiting, tenant isolation, cost tracking
+**Goal:** Multi-tenant demo with production-grade validation and observability.
 
-**Deliverable:** Production-ready for first Danish PoC customer. Security audit passed.
+| Task | Description | Owner |
+|------|-------------|-------|
+| Tenant CRUD | Create/update/delete tenants, manage API keys | Dev 2 |
+| Tenant isolation | Request-scoped tenant context, data isolation in queries | Dev 2 |
+| Rate limiting | Per-tenant, per-channel rate limits via Redis | Dev 2 |
+| Full validation pipeline | Remaining 6 layers (tenant, content, compliance, DNC, dedup, enrich) | Dev 2 + Claude |
+| OpenTelemetry tracing | End-to-end traces: API -> validation -> cascade -> provider -> DLR | Dev 1 |
+| Prometheus metrics | Message counts, latencies, error rates, provider health, cascade outcomes | Dev 1 |
+| Grafana dashboards | Message flow dashboard, provider health, tenant usage | Dev 3 |
+| Load testing | k6 script: 1000 msg/sec sustained, measure latency distribution | Dev 3 |
+| E2E integration tests | Multi-tenant scenarios, cascade fallback, provider failure | Claude |
+| Docker Compose full stack | All services + Grafana + Prometheus in one `docker compose up` | Dev 3 |
+
+**Exit Criteria:**
+
+- Two tenants sending messages independently with no data leakage
+- Rate limiting enforced per tenant
+- 9-layer validation pipeline operational
+- 1000 msg/sec load test passes with p99 < 2s end-to-end
+- Grafana dashboard shows live message flow
+- Full Docker Compose demo: `docker compose up` -> create tenant -> send messages -> view in Grafana
+
+---
+
+### Phase 4: Production Readiness (Weeks 5-8) -- Post-MVP
+
+**Goal:** Harden MVP for production deployment and first customers.
+
+| Task | Timeline | Description |
+|------|----------|-------------|
+| Kubernetes manifests | Week 5 | Helm chart or Kustomize for Hermes services |
+| Secrets management | Week 5 | HashiCorp Vault for API keys, provider credentials |
+| TLS everywhere | Week 5 | mTLS between services, TLS for external APIs |
+| Monitoring + alerting | Week 6 | Prometheus alerting rules (~30 alerts), PagerDuty/Slack |
+| Sandbox environment | Week 6 | Isolated tenant sandbox for testing integrations |
+| WhatsApp Cloud API adapter | Week 6 | WASM adapter for WhatsApp Business Cloud API |
+| Additional SMS aggregators | Week 7 | Vonage and/or Messente WASM adapters |
+| Restate prototype | Week 7-8 | Build CascadeWorkflow in Restate, compare with Temporal |
+| Security audit | Week 8 | External review of auth, tenant isolation, WASM sandbox |
+| Documentation | Week 8 | API docs (OpenAPI), onboarding guide, runbook |
+
+**Exit Criteria:**
+
+- Deployed to Kubernetes (staging environment)
+- Secrets in Vault, no hardcoded credentials
+- 4+ provider adapters operational (Twilio, SES, FCM, WhatsApp)
+- Restate vs Temporal comparison documented with recommendation
+- Security audit passed with no critical findings
+
+---
+
+### Phase 5: Carrier-Direct (Business Decision -- Future)
+
+> This phase is triggered by business metrics, not a fixed timeline.
+
+**Trigger criteria** (any of these may justify the investment):
+
+- SMS aggregator margins below target threshold
+- Monthly SMS volume exceeds N million (carrier contracts become economical)
+- Customer requires carrier-direct for compliance/latency reasons
+- Team has 6+ months of platform operational experience
+
+**Scope (when triggered):**
+
+| Task | Description |
+|------|-------------|
+| Ergo Framework actor mesh | SMPPSupervisor, CarrierSupervisor, ConnectionActor (all research done) |
+| gosmpp fork | TLS wrapping, PDU validation, fuzz testing |
+| SMPP adapter | Ergo actors replacing WASM adapter for SMPP-connected carriers |
+| HLR/MNP lookups | Redis-cached, async refresh |
+| KumoMTA deployment | Lua config, ISP throttling, IP warming (8-week process) |
+| Carrier contracts | Telia, TDC, etc. (3-6 month negotiation) |
+
+**Architecture impact:** Minimal. The hexagonal architecture means carrier-direct adapters implement the same `ProviderAdapter` port interface. The cascade engine, router, validation pipeline, and tenant management are completely unaffected.
 
 ---
 
 ## Key Technology Decisions
 
-| Decision Area          | Choice                                              | Rationale                                                      |
-|------------------------|-----------------------------------------------------|----------------------------------------------------------------|
-| Cascade Engine         | Temporal (primary) + Restate (prototype)            | Temporal proven at Twilio scale; Restate evaluated for latency |
-| Carrier Connectivity   | Ergo Framework v3 actors                            | OTP supervision, gen.Stage backpressure, 21M msg/sec           |
-| REST Adapters          | WASM via Wazero                                     | Sandboxed, hot-swappable, ~57ns call overhead                  |
-| Protocol Adapters      | Ergo actors (gen.Server + TCP Meta Process)         | Stateful connections need actor lifecycle management            |
-| Email Delivery         | KumoMTA (self-hosted)                               | 7M+/hr/node, IP warming, bounce handling built in              |
-| Message Transport      | NATS JetStream                                      | Sub-ms publish, persistent streams, proven at scale            |
-| Cascade State          | Temporal/Restate persistence (not NATS KV)          | Eliminates 153M-key scaling problem                            |
-| DLR Correlation        | Actor-local state in DLRProcessor                   | No external store needed, lives with SMPP connection           |
-| Secrets                | HashiCorp Vault                                     | Dynamic secrets, rotation, audit trail                         |
-| SMPP Library           | Hardened gosmpp fork                                | Add TLS, PDU validation, fuzz testing to existing library      |
-| Auth                   | API keys (Phase 0) + OAuth2/mTLS (Phase 5)         | Progressive security; API keys for MVP speed                   |
-| HLR                    | Redis cache + async lookup                          | Sub-ms cache hits, background refresh                          |
-| Monitoring             | OpenTelemetry + Prometheus + Grafana                | Industry standard, ~45 metrics, ~30 alerts                     |
-| ML Routing             | Deferred (rule-based first)                         | Need 6+ months of delivery data before ML adds value           |
-| RCS Channel            | Deferred                                            | Market adoption insufficient, revisit 2027                     |
-| Multi-DC               | Deferred (single-DC with HA)                        | Premature; add when customer demand requires it                |
+| Decision Area | MVP Choice | Future Option | Rationale |
+|---------------|-----------|---------------|-----------|
+| **Language** | Go | -- | Performance, concurrency, mature ecosystem |
+| **Cascade Engine** | Temporal.io | Restate (prototype in Phase 4) | Temporal proven at Twilio scale (billions of messages). Go SDK mature (v1.31+). |
+| **Provider Adapters** | WASM via Wazero | Ergo actors for SMPP (Phase 5) | Sandboxed, hot-swappable, ~57ns call overhead. TinyGo compilation. |
+| **Message Transport** | NATS JetStream | -- | Sub-ms publish, persistent streams, proven at scale, built-in backpressure |
+| **State Persistence** | Temporal (cascade) + PostgreSQL (config) | -- | Eliminates custom event sourcing. Temporal handles durable state. |
+| **SMS Delivery** | Twilio / Vonage / Messente (aggregator API) | Carrier-direct SMPP (Phase 5) | Aggregators handle carrier contracts, routing, compliance. |
+| **Email Delivery** | Amazon SES | KumoMTA (Phase 5) | SES handles deliverability, IP reputation, DKIM, bounces. No 8-week IP warming. |
+| **Push Notifications** | Firebase Cloud Messaging (FCM) | -- | De facto standard, free tier, reliable |
+| **WhatsApp** | Meta Cloud API | -- | No BSP partnership needed. Cloud API is sufficient. |
+| **API Framework** | Chi router (net/http) | -- | Minimal overhead, composable middleware, no framework lock-in |
+| **Auth** | API keys | OAuth2 / mTLS (Phase 4) | API keys for MVP speed. Progressive security. |
+| **Rate Limiting** | Redis (sliding window) | -- | Sub-ms checks, per-tenant counters |
+| **Monitoring** | OpenTelemetry + Prometheus + Grafana | -- | Industry standard. End-to-end trace correlation. |
+| **Secrets** | Environment variables | HashiCorp Vault (Phase 4) | Env vars for MVP. Vault for production rotation and audit. |
+| **Deployment** | Docker Compose | Kubernetes + Helm (Phase 4) | Docker Compose for dev and demo. K8s for production. |
 
 ---
 
-## What We're NOT Building (and Why)
+## What We're NOT Building in MVP (and Why)
 
-| Not Building                            | Why                                                                                   |
-|-----------------------------------------|---------------------------------------------------------------------------------------|
-| Custom MTA                              | KumoMTA does it better (7M+/hr, Lua config, IP warming, bounce handling)              |
-| WhatsApp BSP                            | WhatsApp Cloud API is sufficient; BSP requires Meta partnership and compliance burden  |
-| Custom event sourcing                   | Temporal/Restate provide durable execution out of the box                              |
-| Docker containers for adapters          | WASM is lighter (~57ns overhead vs container cold start), sandboxed by default         |
-| eBPF for SMPP inspection                | Overkill; actor-level metrics give sufficient visibility                               |
-| Edge computing for routing              | Routing decisions need central state (carrier capacity, HLR); edge adds latency       |
-| CRDTs for cascade state                 | Durable execution makes eventual consistency unnecessary for cascades                  |
-| Multi-DC active-active                  | Premature optimization; single-DC HA is sufficient for 22M/day                        |
-| Full ML routing                         | Need 6+ months of historical delivery data; rule-based routing is correct for launch   |
-
----
-
-## Honest Timeline: 2-3 Devs + Claude
-
-### 1-Month MVP Includes
-
-- Working REST API (`POST /v1/messages`)
-- Cascade engine on Temporal (durable, crash-recoverable)
-- SMPP actor mesh with Ergo (against simulator)
-- 2-3 WASM adapters (SendGrid, Twilio REST, FCM)
-- Smart Router (basic rule-based)
-- Docker Compose for local dev
-- ~60% test coverage on core paths
-
-### Cannot Ship in 1 Month
-
-- KumoMTA integration (8-week IP warming alone)
-- Full security hardening
-- Production carrier connections (need contracts)
-- Kubernetes/Terraform deployment
-- gosmpp security audit
-- Monitoring dashboards
-- Sandbox environment
-- Restate prototype
-
-### Honest Assessment
-
-| Milestone                        | Timeline     |
-|----------------------------------|--------------|
-| Working demoable MVP             | 1 month      |
-| Production-ready for first customer | 3-4 months |
-| Carrier-direct at scale          | 6-9 months   |
-
-### Recommended Team Split
-
-| Dev             | Focus                                      | Skills Required                        |
-|-----------------|--------------------------------------------|----------------------------------------|
-| Dev 1 (Lead)    | Architecture, cascade engine, Temporal      | Go, distributed systems, Temporal      |
-| Dev 2           | SMPP + Ergo actors, carrier connectivity    | Go, networking, TCP protocols          |
-| Dev 3           | API + WASM adapters, DevOps, CI/CD          | Go, Docker, WASM, infrastructure       |
-| Claude          | Code generation, tests, adapters, docs      | Everything, 24/7                       |
+| Not Building | Why | When It Makes Sense |
+|-------------|-----|-------------------|
+| SMPP carrier connections | Aggregators handle carrier protocols. Team has no SMPP experience. | Phase 5: when margins justify carrier contracts |
+| Own MTA (KumoMTA) | SES handles deliverability, reputation, DKIM, bouncing. IP warming takes 8 weeks. | Phase 5: when email volume makes SES costs significant |
+| HLR/MNP lookups | Aggregators handle number routing and porting databases. | Phase 5: with carrier-direct, need own routing |
+| Ergo actor supervision trees | Only needed for stateful protocol connections (SMPP). Aggregator APIs are stateless HTTP. | Phase 5: actor mesh for SMPP connection management |
+| SMPP/SMTP inbound gateway | MVP is REST-only inbound. Enterprise SMPP inbound is a niche requirement. | Phase 4+: when enterprise customers require it |
+| Multi-DC active-active | Single DC with HA is sufficient for 22M/day. Premature optimization. | When customer SLAs or geography require it |
+| ML-based routing | Need 6+ months of historical delivery data before ML adds value over rules. | After accumulating delivery data across providers |
+| WhatsApp BSP | Cloud API is sufficient. BSP requires Meta partnership and compliance burden. | Only if > $5M ARR and Cloud API limits hit |
+| Custom event sourcing | Temporal/Restate provide durable execution out of the box. | Never -- this is the whole point of Temporal |
+| IP reputation engine | SES manages IP reputation. Not our problem in MVP. | Phase 5: with own MTA |
 
 ---
 
-## Verification Plan
+## What We Preserve for Phase 2+
 
-### Phase 1 Verification: Cascade Engine Prototypes
+All research completed to date remains valid and directly applicable:
 
-| Test                              | Method                                                      | Pass Criteria                      |
-|-----------------------------------|-------------------------------------------------------------|------------------------------------|
-| Cascade executes 3 channels       | Send message, observe workflow history                      | All 3 channels attempted in order  |
-| DLR signals complete cascade      | Simulate DLR webhook, verify workflow completes             | Workflow marked delivered           |
-| Timeout triggers fallback         | Delay DLR past timeout, verify next channel fires           | Fallback within 1s of timeout      |
-| Crash recovery                    | Kill worker mid-cascade, restart, verify resumption         | Message delivered despite crash     |
-| Latency                           | OTel traces on 1000-message batch                           | p99 < 500ms per cascade step       |
-| Temporal vs Restate comparison    | Run identical scenarios, compare metrics                    | Documented trade-off analysis      |
+| Research Area | Document | Applicability |
+|--------------|----------|---------------|
+| Temporal.io cascade patterns | `docs/research/temporal-deep-dive.md` | **Phase 1 (now)** -- cascade engine implementation |
+| Ergo Framework actor mesh | `docs/research/actor-model-wasm.md` | **Phase 5** -- SMPP carrier mesh when carrier-direct |
+| WASM/Wazero adapter strategy | `docs/research/actor-model-wasm.md` | **Phase 2 (now)** -- provider adapters |
+| KumoMTA evaluation | `docs/research/technology-investigation.md` | **Phase 5** -- own MTA when email volume justifies |
+| Encryption strategy (Signal Protocol) | `docs/research/encryption-strategy.md` | **Future** -- end-to-end encryption offering |
+| 9-layer validation pipeline | `docs/adr/ADR-001-hermes-platform-architecture.md` | **Phase 1-3 (now)** -- validation pipeline |
+| Expert review findings | `docs/reviews/` | **Ongoing** -- architecture quality gates |
 
-### Phase 2 Verification: SMPP Carrier Mesh
+### Phase 5+ Product Vision: Email as a Platform
 
-| Test                              | Method                                                      | Pass Criteria                      |
-|-----------------------------------|-------------------------------------------------------------|------------------------------------|
-| Connection lifecycle              | Bind, send, unbind to SMPP simulator                        | Clean session management           |
-| Supervisor auto-restart           | Kill ConnectionActor, verify restart                        | New connection within 5s           |
-| Backpressure                      | Flood actor mesh, observe gen.Stage throttling              | No message loss, throughput caps   |
-| DLR correlation                   | Send message, receive DLR, verify ID mapping                | Internal ID resolved from SMSC ID  |
-| Window tracking                   | Send N messages, verify in-flight window respected          | Never exceeds configured window    |
-| Multi-carrier routing             | Route to telia-dk vs tdc based on prefix                    | Correct carrier selected           |
+Beyond owning the delivery lifecycle (KumoMTA, SMPP-direct), Hermes can build **value-added services on top of email** that aggregators and SES don't offer:
 
-### Phase 3 Verification: WASM Adapters
+| Capability | Description | Competitive Advantage |
+|-----------|-------------|----------------------|
+| **Email Security Scanning** | Phishing detection, malware link scanning, content threat analysis on outbound | Customers trust Hermes not just for delivery but for protecting their brand |
+| **Encryption Services** | S/MIME, PGP, or custom encryption for sensitive email (healthcare, finance) | Enterprise differentiator — no aggregator offers this |
+| **Compliance Engine** | GDPR data residency enforcement, retention policies, audit trails per jurisdiction | Regulatory selling point for EU customers |
+| **Analytics & Engagement** | Open tracking, click tracking, engagement scoring, deliverability insights | Deeper analytics than SES provides out of the box |
+| **Hosted SMTP Service** | Customers point their SMTP at Hermes instead of configuring SES directly | Simpler DX, stickier product, full control over the email pipeline |
+| **Abuse Prevention** | Outbound content scanning, reputation monitoring, automatic throttling | Protects shared IP reputation across tenants |
 
-| Test                              | Method                                                      | Pass Criteria                      |
-|-----------------------------------|-------------------------------------------------------------|------------------------------------|
-| WASM adapter loads                | Compile .wasm, load in Wazero host                          | OnConfigure returns success        |
-| SendHTTP works                    | Adapter calls SendHTTP, verify HTTP request made            | Correct URL, headers, body         |
-| Sandboxing                        | Attempt file system / network access from WASM              | Denied by default                  |
-| Hot-swap                          | Replace .wasm at runtime, verify new version active         | Zero-downtime swap                 |
-| Health check                      | Call OnHealthCheck, verify adapter responds                 | Returns true when healthy          |
-| Error handling                    | Simulate HTTP 500 from provider                             | Error surfaced to cascade engine   |
+This transforms Hermes from a **delivery broker** into an **email intelligence platform** — a much larger TAM and stronger moat than pure message routing.
 
-### End-to-End Verification
+> **Trigger:** Pursue this when MVP is stable and customer feedback validates demand for email features beyond basic delivery.
 
-| Test                              | Method                                                      | Pass Criteria                      |
-|-----------------------------------|-------------------------------------------------------------|------------------------------------|
-| Full message lifecycle            | REST API -> validation -> cascade -> SMPP delivery -> DLR   | Message delivered, DLR received    |
-| Multi-channel fallback            | SMS fails, email succeeds                                   | Cascade falls through correctly    |
-| Tenant isolation                  | Two tenants, verify no data leakage                         | Strict separation                  |
-| Load test                         | 1000 msg/sec sustained for 5 minutes                        | No errors, p99 < 2s               |
-| Chaos test                        | Random pod/actor kills during load                          | All messages eventually delivered  |
+### Architecture Guarantees for Future Expansion
 
----
+The hexagonal architecture ensures these swaps are **adapter changes, not rewrites:**
 
-## Expert Review Scores (Context)
+```
+MVP (Phase 1-3)                          Future (Phase 5+)
+─────────────────                        ─────────────────
+Twilio WASM adapter  ──────────────→     SMPP Ergo actor adapter
+  (implements ProviderAdapter)             (implements ProviderAdapter)
 
-The next-gen architecture addresses findings from 5 expert reviews of the original ADR:
+Amazon SES WASM adapter  ─────────→     KumoMTA adapter
+  (implements ProviderAdapter)             (implements ProviderAdapter)
 
-| Review                    | Score   | Key Finding Addressed                                         |
-|---------------------------|---------|---------------------------------------------------------------|
-| System Architect          | 6.5/10  | State persistence (2/10) -> Temporal durable execution        |
-| Security Audit            | 7.0/10  | Adapter supply chain -> WASM sandboxing replaces containers   |
-| Carrier-Direct Architect  | 4/10    | Backpressure (2/10) -> Ergo gen.Stage demand-driven flow      |
-| Carrier-Direct Mentor     | 4/10    | "Timeline is fiction" -> Adjusted to honest 1mo MVP / 3-4mo production |
-| DevOps                    | (from reviews) | Operational complexity -> KumoMTA replaces custom MTA    |
+Redis HLR stub  ──────────────────→     Real HLR/MNP lookup + Redis cache
+  (implements RouteSelector)               (implements RouteSelector)
+```
+
+The cascade engine, validation pipeline, tenant management, API gateway, and observability layer are **completely unchanged** when swapping providers.
 
 ---
 
@@ -483,67 +595,190 @@ The next-gen architecture addresses findings from 5 expert reviews of the origin
 
 ### Technical Risks
 
-| Risk | Severity | Probability | Mitigation |
-|------|----------|-------------|------------|
-| Ergo v3 is relatively new (Feb 2026) | Medium | Low | Zero deps, MIT license, can fork. Actor patterns well-understood. |
-| Temporal operational overhead | Medium | Medium | Start with PostgreSQL. Cassandra migration planned for scale. |
-| Wazero WASI gaps | Low | Low | Only need basic host functions. WASI preview 1 sufficient. |
-| KumoMTA young open source | Medium | Low | Apache 2 license, PowerMTA team. Haraka as fallback. |
-| TinyGo WASM compilation limits | Medium | Medium | Adapters are simple HTTP transforms — within TinyGo capability. |
-| `numHistoryShards` immutable in Temporal | High | Medium | Set correctly before production (2048-4096). Cannot change later. |
-| gosmpp single-maintainer, no security audit | High | Medium | Fork into hermes-platform org. Commission external audit. |
+| # | Risk | Severity | Probability | Mitigation |
+|---|------|----------|-------------|------------|
+| T1 | Temporal operational complexity (cluster + PostgreSQL + Elasticsearch) | Medium | Medium | Start with PostgreSQL backend (simplest). Evaluate Temporal Cloud if self-hosted is too heavy. Restate as alternative (single binary). |
+| T2 | TinyGo WASM compilation limits (no full reflect, limited stdlib) | Medium | Medium | Adapters are simple HTTP transforms -- within TinyGo capability. **Exception: Amazon SES adapter must be native Go** (AWS SDK v2 uses reflection). Other adapters (Twilio, FCM, WhatsApp) use simple REST and compile fine with TinyGo. |
+| T3 | NATS JetStream tuning for high throughput | Low | Low | Well-documented. Start with defaults, tune stream/consumer config under load test. |
+| T4 | Wazero WASI gaps (host function limitations) | Low | Low | Only need `SendHTTP`, `Log`, `GetConfig`, `EmitMetric`. WASI preview 1 sufficient. |
+| T5 | `numHistoryShards` immutable in Temporal | High | Medium | Set correctly before production data (2048-4096 recommended). Cannot change later without migration. |
+| T6 | Provider webhook reliability (DLR delivery not guaranteed) | Medium | Medium | Implement DLR timeout with cascade fallback. Periodic polling for stuck messages. Reconciliation job. |
+| T7 | WASM adapter cold start latency | Low | Low | Wazero benchmarked at p50=10ms, p99=30ms (Arcjet production). Pre-warm adapters on startup. |
 
 ### Business Risks
 
-| Risk | Severity | Probability | Mitigation |
-|------|----------|-------------|------------|
-| Carrier contracts take 3-6 months | High | High | Start negotiations in parallel with development. Hire telecom consultant. |
-| Danish telecom registration required | **Critical** | Certain | Legal process must start immediately — criminal offense to operate without it. |
-| IP warming takes 8 weeks minimum | Medium | Certain | Physical constraint, cannot be accelerated. Start in Phase 4. |
-| No team SMPP experience | High | High | SMPP simulator first. Real carriers only after security audit. |
-| Analysis paralysis (mentor: 85% probability) | High | High | This plan exists to prevent it. Ship MVP in 4 weeks. |
+| # | Risk | Severity | Probability | Mitigation |
+|---|------|----------|-------------|------------|
+| B1 | Aggregator pricing changes (Twilio raises rates) | Medium | Medium | Support multiple aggregators from launch. WASM adapter per provider. Switch routing in minutes. |
+| B2 | SES sending limit too low for launch | Medium | Low | Default 200/sec, need to request increase. Apply early (takes 24-48 hours). Dedicated IPs available. |
+| B3 | Aggregator rate limits throttle throughput | Medium | Medium | Multi-provider routing distributes load. Per-provider rate limit tracking in Smart Router. |
+| B4 | Customer perception: "just a wrapper" | Medium | Medium | Communicate value: cascade engine, multi-tenancy, unified observability, compliance. These are hard problems. |
+| B5 | Analysis paralysis (85% probability per mentor review) | High | High | This plan exists to prevent it. Ship MVP in 4 weeks. Iterate based on real customer feedback. |
+| B6 | Provider lock-in concern | Low | Low | WASM adapters abstract providers. Hexagonal architecture ensures swappability. Demonstrate with multi-provider routing. |
+| B7 | Danish telecom registration for aggregator model | Medium | Unknown | Aggregator-only model may still require registration if Hermes transforms/manipulates messages. **Legal must evaluate immediately in Week 1.** Criminal offense risk if operating without required registration. |
 
-### Expert-Recommended Alternative Path
+### Mitigated Risks (vs. v1.0 Plan)
 
-The expert reviews suggested a more conservative ordering than this plan:
+These risks from the carrier-direct plan are **eliminated** by the aggregator-first approach:
 
-| Phase | Expert Recommendation | This Plan |
-|-------|----------------------|-----------|
-| **First** | Cascade Engine + aggregator APIs (SendGrid/Twilio). Get PoC customers live. | Same (Phase 0-1) |
-| **Parallel** | Start carrier contract negotiations. Hire telecom consultant. | Same (business track) |
-| **Second** | SMPP inbound for enterprise clients. Smart routing against aggregators. | Phase 2 (SMPP actor mesh) |
-| **Third** | First direct carrier connection after contract signed. | Phase 5 (production hardening) |
-| **Only if email > 2B/year** | MTA investigation | Phase 4 (KumoMTA) |
-| **Never until $5M+ ARR** | WhatsApp BSP | Not in plan (using Cloud API) |
+| Risk (from v1.0) | Status | Why |
+|-------------------|--------|-----|
+| Carrier contracts take 3-6 months | **Eliminated** | Aggregators have contracts |
+| Danish telecom registration (criminal offense) | **Eliminated** | Aggregators are registered operators |
+| IP warming takes 8 weeks | **Eliminated** | SES handles reputation |
+| No team SMPP experience | **Eliminated** | No SMPP in MVP |
+| gosmpp single-maintainer / no security audit | **Eliminated** | No gosmpp in MVP |
+| Ergo v3 is new (Feb 2026) | **Deferred** | No Ergo in MVP |
+| KumoMTA young open source | **Eliminated** | Using SES instead |
 
-The key difference: experts recommend shipping the cascade engine with aggregator APIs as the MVP product, and treating carrier-direct as a later optimization. This plan follows that philosophy — Phases 0-1 use simulated providers, with real carrier connections deferred to post-security-audit.
+---
+
+## Team Allocation
+
+### 3 Developers + Claude (4-Week MVP Sprint)
+
+| Role | Focus Areas | Key Skills |
+|------|-------------|------------|
+| **Dev 1 (Lead)** | Architecture, cascade engine (Temporal), WASM host (Wazero), OpenTelemetry | Go, distributed systems, Temporal SDK, system design |
+| **Dev 2** | REST API, validation pipeline, multi-tenancy, Smart Router, rate limiting | Go, API design, PostgreSQL, Redis, security |
+| **Dev 3** | WASM adapters (Twilio/SES/FCM), provider integration, Docker Compose, CI/CD, load testing | Go, TinyGo, Docker, infrastructure, third-party API integration |
+| **Claude** | Code generation, unit tests, integration tests, adapter scaffolding, documentation | Everything, 24/7 availability |
+
+### Week-by-Week Allocation
+
+| Week | Dev 1 | Dev 2 | Dev 3 | Claude |
+|------|-------|-------|-------|--------|
+| **1** | Go workspace, domain types, port interfaces | Error taxonomy, PostgreSQL schema, NATS streams | Docker Compose, CI pipeline | README, test scaffolding, godoc |
+| **2** | CascadeWorkflow (Temporal), DLR signals | REST API, validation (3 layers) | Mock providers, NATS consumer | Integration tests, mock helpers |
+| **3** | WASM host (Wazero), module loader | Smart Router, provider health | Twilio + SES + FCM adapters | FCM adapter, adapter unit tests |
+| **4** | OpenTelemetry tracing, Prometheus metrics | Tenant CRUD, rate limiting, full validation | Grafana dashboards, load testing, full Docker Compose | E2E tests, remaining validation layers, docs |
+
+---
+
+## Cost Analysis
+
+### Aggregator Costs (SMS)
+
+| Provider | Cost per SMS (US) | Cost per SMS (EU/DK) | DLR Included | Notes |
+|----------|-------------------|----------------------|--------------|-------|
+| **Twilio** | $0.0079 | $0.04-0.09 (varies by country) | Yes | Most mature API, best docs |
+| **Vonage (Nexmo)** | $0.0068 | $0.03-0.08 | Yes | Good EU coverage |
+| **Messente** | $0.005-0.01 | $0.02-0.06 | Yes | Strong Nordic/EU focus, competitive pricing |
+| **Carrier-direct** (future) | $0.001-0.003 | $0.005-0.02 | Yes | Requires contracts, SMPP, compliance |
+
+**Margin example at early stage (1M SMS/month, EU):**
+
+| Path | Cost per SMS | Total Cost | Hermes Price | Gross Margin |
+|------|-------------|------------|--------------|--------------|
+| Messente (aggregator) | ~$0.04 | $40,000 | $0.06 | $20,000/mo (33%) |
+| Carrier-direct (future) | ~$0.01 | $10,000 | $0.06 | $50,000/mo (83%) |
+
+**Margin example at scale (100M SMS/month, EU):**
+
+| Path | Cost per SMS | Total Cost | Hermes Price | Gross Margin |
+|------|-------------|------------|--------------|--------------|
+| Messente (aggregator) | ~$0.04 | $4,000,000 | $0.06 | $2,000,000/mo (33%) |
+| Carrier-direct (future) | ~$0.01 | $1,000,000 | $0.06 | $5,000,000/mo (83%) |
+
+Even at 1M SMS/month with aggregator pricing, margins are $20K/month — viable from day one. Carrier-direct is a **margin optimization**, not a business enabler. At scale, the margin delta ($3M/month) justifies the Phase 5 investment.
+
+### Amazon SES Costs (Email)
+
+| Component | Cost | Notes |
+|-----------|------|-------|
+| Sending | $0.10 per 1,000 emails | First 62,000/month free (from EC2) |
+| Dedicated IPs | $24.95/month per IP | Optional, for high-volume senders |
+| Receiving | $0.10 per 1,000 emails | If accepting inbound |
+| Attachments | $0.12 per GB | Outbound data |
+
+**At 6B emails/year (500M/month):**
+
+| Component | Monthly Cost |
+|-----------|-------------|
+| Sending (500M x $0.10/1000) | $50,000 |
+| Dedicated IPs (10 IPs) | $250 |
+| **Total SES** | **~$50,250/month** |
+| **Hermes price (at $0.20/1000)** | **$100,000/month** |
+| **Gross margin** | **~$50,000/month (50%)** |
+
+KumoMTA would reduce the $50K/month to infrastructure costs (~$5K/month for servers), but that optimization can wait.
+
+### Infrastructure Costs (MVP)
+
+| Component | Specification | Monthly Cost |
+|-----------|--------------|-------------|
+| Temporal Server | 2 vCPU, 8GB RAM | $80-150 |
+| PostgreSQL | 2 vCPU, 8GB RAM, 100GB SSD | $80-150 |
+| NATS Server | 2 vCPU, 4GB RAM | $40-80 |
+| Redis | 2 vCPU, 4GB RAM | $40-80 |
+| Hermes API (2 instances) | 2 vCPU, 4GB RAM each | $80-160 |
+| Hermes Cascade Workers (2) | 2 vCPU, 4GB RAM each | $80-160 |
+| Monitoring (Prometheus + Grafana) | 2 vCPU, 8GB RAM | $80-150 |
+| **Total MVP Infrastructure** | | **$480-930/month** |
+
+Compare to carrier-direct v1.0 plan: KumoMTA alone would need 2-4 high-memory servers (~$500-1000/month), plus SMPP connection servers, HLR lookup infrastructure, etc. Aggregator-first cuts infrastructure costs by 60-70%.
+
+---
+
+## Decision Points for Team
+
+These decisions require team consensus before Phase 0 begins:
+
+### Must Decide Now
+
+| # | Decision | Options | Recommendation |
+|---|----------|---------|----------------|
+| 1 | **Accept aggregator-first strategy?** | (a) Aggregator-first MVP, carrier-direct later (b) Carrier-direct from day one | **(a)** -- 4-week MVP vs. 20+ weeks, eliminated risks, margins still viable |
+| 2 | **Accept Temporal as cascade engine?** | (a) Temporal only (b) Temporal + Restate prototype (c) Restate only | **(a)** for MVP, **(b)** in Phase 4 -- Temporal is proven at Twilio scale, Restate prototype can inform future |
+| 3 | **Accept WASM for provider adapters?** | (a) WASM/Wazero (b) Native Go plugins (c) gRPC microservices | **(a)** -- sandboxed, hot-swappable, ~57ns overhead, no container orchestration |
+| 4 | **Which SMS aggregator(s) to start with?** | (a) Twilio only (b) Twilio + Messente (c) Messente only | **(b)** -- Twilio for best docs/sandbox, Messente for competitive EU pricing |
+| 5 | **SES region selection?** | (a) eu-west-1 (Ireland) (b) eu-central-1 (Frankfurt) (c) us-east-1 | **(a)** or **(b)** -- EU data residency for GDPR compliance |
+
+### Decide During MVP
+
+| # | Decision | Decide By | Context |
+|---|----------|-----------|---------|
+| 6 | Restate vs. Temporal long-term | End of Phase 4 (Week 8) | Build Restate prototype, compare operationally |
+| 7 | When to evaluate carrier-direct | Quarterly review | Based on volume, margins, team expertise |
+| 8 | Kubernetes vs. managed containers | Phase 4 (Week 5) | K8s only if team has experience; otherwise ECS/Cloud Run |
+| 9 | Dedicated SES IPs vs. shared | Phase 3 (Week 4) | Depends on customer email volume and deliverability requirements |
 
 ---
 
 ## Sources
 
-- [Temporal Go SDK](https://github.com/temporalio/sdk-go)
-- [Restate Go SDK](https://github.com/restatedev/sdk-go)
-- [Ergo Framework v3](https://github.com/ergo-services/ergo)
-- [Wazero](https://wazero.io/)
-- [KumoMTA](https://kumomta.com)
-- [knqyf263/go-plugin](https://github.com/knqyf263/go-plugin)
-- [gosmpp](https://github.com/linxGnu/gosmpp)
+### Core Technologies (MVP)
+
+- [Temporal.io Go SDK](https://github.com/temporalio/sdk-go) -- Durable execution, cascade engine
+- [Temporal Documentation](https://docs.temporal.io/) -- Workflow, Activity, Signal, Timer patterns
+- [Restate Go SDK](https://github.com/restatedev/sdk-go) -- Alternative cascade engine (Phase 4 prototype)
+- [Wazero](https://wazero.io/) -- Zero-dependency WebAssembly runtime for Go
+- [TinyGo](https://tinygo.org/) -- Go compiler targeting WASM
+- [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream) -- Persistent message streaming
+- [Chi Router](https://github.com/go-chi/chi) -- Lightweight HTTP router for Go
+
+### Provider APIs (MVP)
+
+- [Twilio SMS API](https://www.twilio.com/docs/sms/api) -- SMS aggregator
+- [Vonage SMS API](https://developer.vonage.com/en/messaging/sms/overview) -- SMS aggregator
+- [Messente API](https://messente.com/documentation) -- SMS aggregator (EU focus)
+- [Amazon SES v2 API](https://docs.aws.amazon.com/ses/latest/APIReference-V2/) -- Email delivery
+- [Firebase Cloud Messaging](https://firebase.google.com/docs/cloud-messaging) -- Push notifications
+- [WhatsApp Cloud API](https://developers.facebook.com/docs/whatsapp/cloud-api/) -- WhatsApp messaging
+
+### Observability
+
+- [OpenTelemetry Go](https://opentelemetry.io/docs/languages/go/) -- Distributed tracing and metrics
+- [Prometheus](https://prometheus.io/) -- Metrics collection and alerting
+- [Grafana](https://grafana.com/) -- Dashboards and visualization
+
+### Deferred Technologies (Phase 5+ Research)
+
+- [Ergo Framework v3](https://github.com/ergo-services/ergo) -- OTP-style actor mesh for SMPP
+- [KumoMTA](https://kumomta.com) -- High-performance MTA for email
+- [gosmpp](https://github.com/linxGnu/gosmpp) -- SMPP client library for Go
+- [knqyf263/go-plugin](https://github.com/knqyf263/go-plugin) -- WASM plugin framework
 
 ---
 
-## Decision Required
-
-This plan requires team approval before Phase 0 begins. Key decisions for discussion:
-
-1. **Cascade engine:** Accept dual-prototype approach (Temporal + Restate)?
-2. **Adapter strategy:** Confirm hybrid WASM + Ergo actors?
-3. **KumoMTA vs SES:** Commit to own MTA for email, or keep SES as primary?
-4. **Team allocation:** Agree on dev focus areas?
-5. **Timeline:** Accept 1-month MVP scope with items explicitly deferred?
-6. **Legal:** Who initiates Danish telecom registration? (Criminal offense blocker)
-7. **Carrier contracts:** Who starts Telia/TDC negotiations in parallel?
-
----
-
-*Generated: 2026-02-11 | Status: PENDING TEAM APPROVAL*
+*Generated: 2026-02-16 | Revision: 2.0 (Aggregator-First Pivot) | Status: PENDING TEAM APPROVAL*

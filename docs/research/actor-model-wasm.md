@@ -1,5 +1,12 @@
 # Actor Model Frameworks & WASM Runtime Comparison
 
+> **Context Note (2026-02-16):** This research was conducted during the carrier-direct planning phase (v1.0). Following the strategic pivot to aggregator-first MVP:
+> - **Part 1 (Actor Frameworks):** Deferred to Phase 5+. Ergo Framework is only needed when/if direct SMPP carrier connections are pursued.
+> - **Part 2 (WASM Runtimes):** Directly relevant NOW. Wazero is used for MVP provider adapters.
+> - **Part 3 (KumoMTA):** Deferred to Phase 5+. Using Amazon SES for MVP email delivery.
+>
+> See `docs/plans/implementation-plan.md` (v2.0) for the current architecture.
+
 ## Executive Summary
 
 Two technology categories were evaluated to solve Hermes's hardest infrastructure problems: (1) Actor frameworks for SMPP carrier connection management (replacing custom connection pools, scored 2/10 on backpressure by architect review), and (2) WASM runtimes for hot-loadable REST channel adapters (replacing Docker containers with Ed25519 signatures and heartbeats).

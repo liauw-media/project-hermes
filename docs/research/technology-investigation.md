@@ -1,5 +1,11 @@
 # Technology Investigation: Next-Generation Architecture
 
+> **Context Note (2026-02-16):** This research was conducted during the carrier-direct planning phase (v1.0). Following the strategic pivot to aggregator-first MVP, the relevant technologies are:
+> - **NOW (MVP):** Temporal.io/Restate (cascade engine), WASM/Wazero (provider adapters), NATS JetStream (transport)
+> - **PHASE 5+ (business decision):** Ergo Framework (SMPP actor mesh), KumoMTA (own MTA), gosmpp (SMPP library)
+>
+> See `docs/plans/implementation-plan.md` (v2.0) for the current architecture.
+
 ## Executive Summary
 
 Three research agents investigated modern technologies to determine whether Project Hermes should follow traditional 2010-era telecom patterns or leverage newer technology to solve infrastructure problems fundamentally better. The investigation covered 10+ technologies across durable execution, actor models, WebAssembly, email infrastructure, edge computing, and data synchronization.
@@ -16,7 +22,7 @@ Three research agents investigated modern technologies to determine whether Proj
 | **Restate** | Durable execution | **PROTOTYPE** — Compare with Temporal |
 | **Ergo Framework v3** | Actor model (Go) | **ADOPTED** — Carrier mesh |
 | **Wazero** | WASM runtime (Go) | **ADOPTED** — REST adapters |
-| **KumoMTA** | Email MTA (Rust) | **ADOPTED** — Email delivery |
+| **KumoMTA** | Email MTA (Rust) | **DEFERRED** — Phase 5 business decision (using SES for MVP) |
 | **knqyf263/go-plugin** | WASM plugin interface | **ADOPTED** — Adapter contract |
 | **NATS JetStream** | Message transport | **RETAINED** — High-throughput delivery transport |
 | eBPF | Kernel-level packet processing | **REJECTED** — SMPP too complex for eBPF |
