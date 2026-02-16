@@ -304,9 +304,13 @@ hermes/
 │   └── whatsapp/                    #   WhatsApp Cloud API adapter
 │
 ├── deploy/
-│   └── docker/                      # Docker Compose (dev + demo)
-│       ├── docker-compose.yml       #   PG, NATS, Redis, Temporal, Grafana
-│       └── docker-compose.prod.yml  #   Production overrides
+│   ├── docker/                      # Docker Compose (dev + demo)
+│   │   ├── docker-compose.yml       #   PG, NATS, Redis, Temporal, Grafana
+│   │   └── docker-compose.prod.yml  #   Production overrides
+│   └── terraform/                   # Hetzner Cloud + RKE2 (production)
+│       ├── main.tf                  #   terraform-hcloud-rke2 module
+│       ├── variables.tf             #   Cluster config (node types, counts)
+│       └── outputs.tf               #   Kubeconfig, IPs
 │
 ├── docs/
 │   ├── adr/                         # Architecture Decision Records
@@ -453,7 +457,7 @@ hermes/
 
 | Task | Timeline | Description |
 |------|----------|-------------|
-| Kubernetes manifests | Week 5 | Helm chart or Kustomize for Hermes services |
+| RKE2 cluster on Hetzner | Week 5 | Provision RKE2 cluster via `terraform-hcloud-rke2` (wenzel-felix) at Falkenstein (`fsn1`). HA control plane (3x CX33), dedicated workers (2x CPX31 + 1x CCX23). |
 | Secrets management | Week 5 | HashiCorp Vault for API keys, provider credentials |
 | TLS everywhere | Week 5 | mTLS between services, TLS for external APIs |
 | Monitoring + alerting | Week 6 | Prometheus alerting rules (~30 alerts), PagerDuty/Slack |
@@ -466,7 +470,7 @@ hermes/
 
 **Exit Criteria:**
 
-- Deployed to Kubernetes (staging environment)
+- RKE2 cluster running on Hetzner Cloud (Falkenstein `fsn1`) with HA control plane
 - Secrets in Vault, no hardcoded credentials
 - 4+ provider adapters operational (Twilio, SES, FCM, WhatsApp)
 - Restate vs Temporal comparison documented with recommendation
@@ -518,7 +522,8 @@ hermes/
 | **Rate Limiting** | Redis (sliding window) | -- | Sub-ms checks, per-tenant counters |
 | **Monitoring** | OpenTelemetry + Prometheus + Grafana | -- | Industry standard. End-to-end trace correlation. |
 | **Secrets** | Environment variables | HashiCorp Vault (Phase 4) | Env vars for MVP. Vault for production rotation and audit. |
-| **Deployment** | Docker Compose | Kubernetes + Helm (Phase 4) | Docker Compose for dev and demo. K8s for production. |
+| **Deployment** | Docker Compose | RKE2 on Hetzner Cloud (Phase 4) | Docker Compose for dev. RKE2 on Hetzner for production (~€121/mo vs ~$1,350/mo on AWS). |
+| **Infrastructure** | Local | Hetzner Cloud, Falkenstein `fsn1` (Phase 4) | 87% cheaper than AWS. 20TB traffic included. GDPR-compliant (Germany). Terraform: `wenzel-felix/rke2/hcloud`. |
 
 ---
 
@@ -703,20 +708,39 @@ Even at 1M SMS/month with aggregator pricing, margins are $20K/month — viable 
 
 KumoMTA would reduce the $50K/month to infrastructure costs (~$5K/month for servers), but that optimization can wait.
 
-### Infrastructure Costs (MVP)
+### Infrastructure Costs: Hetzner Cloud + RKE2
 
-| Component | Specification | Monthly Cost |
-|-----------|--------------|-------------|
-| Temporal Server | 2 vCPU, 8GB RAM | $80-150 |
-| PostgreSQL | 2 vCPU, 8GB RAM, 100GB SSD | $80-150 |
-| NATS Server | 2 vCPU, 4GB RAM | $40-80 |
-| Redis | 2 vCPU, 4GB RAM | $40-80 |
-| Hermes API (2 instances) | 2 vCPU, 4GB RAM each | $80-160 |
-| Hermes Cascade Workers (2) | 2 vCPU, 4GB RAM each | $80-160 |
-| Monitoring (Prometheus + Grafana) | 2 vCPU, 8GB RAM | $80-150 |
-| **Total MVP Infrastructure** | | **$480-930/month** |
+| Phase | Configuration | EUR/month | USD equivalent |
+|-------|--------------|-----------|----------------|
+| **MVP (Weeks 1-4)** | Local Docker Compose | **€0** | $0 |
+| **Staging (Week 5)** | 1x CX43 + 1x CX33 + storage + LB | **~€29-45** | ~$32-49 |
+| **Production v1 (Week 6+)** | 3x CX33 (CP) + 2x CPX31 + 1x CCX23 + 1x CX33 + storage + LB | **~€121** | ~$131 |
+| **Production at scale** | 11 nodes, all CCX dedicated vCPU | **~€399** | ~$432 |
+| **Dedicated alternative** | 3x AX42 bare metal (24 cores, 192GB) | **~€224** | ~$242 |
 
-Compare to carrier-direct v1.0 plan: KumoMTA alone would need 2-4 high-memory servers (~$500-1000/month), plus SMPP connection servers, HLR lookup infrastructure, etc. Aggregator-first cuts infrastructure costs by 60-70%.
+**Production v1 breakdown (€121/month):**
+
+| Role | Server | Specs | Count | EUR/mo |
+|------|--------|-------|-------|--------|
+| Control Plane (HA) | CX33 | 4 vCPU, 8GB | 3 | €16.47 |
+| Workers (stateless) | CPX31 | 4 dedicated vCPU, 8GB | 2 | €32.98 |
+| Workers (stateful: PG, Redis, NATS) | CCX23 | 4 dedicated vCPU, 16GB | 1 | €24.49 |
+| Monitoring | CX33 | 4 vCPU, 8GB | 1 | €5.49 |
+| Block Storage | Volumes | 500GB total | 3 | €22.00 |
+| Load Balancer | LB21 | Medium | 1 | €16.40 |
+| Floating IP | IPv4 | Stable ingress | 1 | €3.57 |
+
+**Hetzner vs AWS comparison (production v1 equivalent):**
+
+| Provider | Monthly Cost | Annual Cost | Savings |
+|----------|-------------|-------------|---------|
+| **Hetzner** | ~€158 (~$170) | ~€1,900 | **87% cheaper** |
+| AWS | ~$1,350 | ~$16,200 | Baseline |
+| GCP | ~$1,280 | ~$15,360 | 5% cheaper than AWS |
+
+> **Why Hetzner:** 20TB traffic included (AWS charges ~$0.09/GB egress). Germany = GDPR. Dedicated servers available at €49/month (8 cores, 64GB DDR5 ECC, NVMe). See `docs/research/hetzner-infrastructure.md` for full analysis.
+
+Compare to carrier-direct v1.0 plan: infrastructure alone would cost $5K+/month on AWS. Aggregator-first on Hetzner runs production for ~€121/month.
 
 ---
 
@@ -740,7 +764,7 @@ These decisions require team consensus before Phase 0 begins:
 |---|----------|-----------|---------|
 | 6 | Restate vs. Temporal long-term | End of Phase 4 (Week 8) | Build Restate prototype, compare operationally |
 | 7 | When to evaluate carrier-direct | Quarterly review | Based on volume, margins, team expertise |
-| 8 | Kubernetes vs. managed containers | Phase 4 (Week 5) | K8s only if team has experience; otherwise ECS/Cloud Run |
+| 8 | Hetzner Cloud vs Dedicated servers | Phase 4 (Week 5) | Start Cloud (flexibility), evaluate AX42 dedicated (€49/mo, 8c/64GB) at stable load |
 | 9 | Dedicated SES IPs vs. shared | Phase 3 (Week 4) | Depends on customer email volume and deliverability requirements |
 
 ---
@@ -765,6 +789,13 @@ These decisions require team consensus before Phase 0 begins:
 - [Amazon SES v2 API](https://docs.aws.amazon.com/ses/latest/APIReference-V2/) -- Email delivery
 - [Firebase Cloud Messaging](https://firebase.google.com/docs/cloud-messaging) -- Push notifications
 - [WhatsApp Cloud API](https://developers.facebook.com/docs/whatsapp/cloud-api/) -- WhatsApp messaging
+
+### Infrastructure
+
+- [Hetzner Cloud](https://www.hetzner.com/cloud/) -- EU cloud hosting (87% cheaper than AWS)
+- [terraform-hcloud-rke2](https://github.com/wenzel-felix/terraform-hcloud-rke2) -- RKE2 on Hetzner Terraform module
+- [RKE2](https://docs.rke2.io/) -- Rancher Kubernetes Engine 2 (CIS-hardened)
+- [Hetzner Infrastructure Research](docs/research/hetzner-infrastructure.md) -- Full pricing, layouts, gotchas
 
 ### Observability
 

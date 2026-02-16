@@ -286,13 +286,13 @@ The original implementation plan (2026-02-11) assumed direct carrier connections
 
 **Team Focus:**
 - Dev 1 (Lead): Security hardening (Vault, TLS, auth), Restate evaluation (if Temporal chosen for MVP)
-- Dev 2: Kubernetes manifests, Helm charts, staging environment, deployment automation
+- Dev 2: RKE2 cluster on Hetzner Cloud via Terraform (`wenzel-felix/rke2/hcloud`), staging deployment
 - Dev 3: Grafana dashboards, alerting rules, customer sandbox, additional adapters
 
 **Claude Focus:**
+- Generate Terraform config for Hetzner RKE2 cluster (HA control plane, worker pools)
 - Generate Vault integration: secret storage, rotation, dynamic credentials
-- Generate Kubernetes manifests: Deployments, Services, ConfigMaps, HPA
-- Generate Helm chart for single-command deployment
+- Generate K8s manifests: Deployments, Services, ConfigMaps, HPA
 - Generate Grafana dashboards (~15 panels): throughput, latency, errors, per-tenant usage
 - Generate alerting rules (~15 alerts): delivery failure rate, cascade timeout rate, provider health
 - Generate WhatsApp Cloud API adapter (.wasm)
@@ -303,12 +303,13 @@ The original implementation plan (2026-02-11) assumed direct carrier connections
 **Deliverables:**
 
 *Weeks 5-6 (Security + Infrastructure):*
+- [ ] RKE2 cluster on Hetzner Cloud: Falkenstein (`fsn1`), 3x CX33 control plane, 2x CPX31 + 1x CCX23 workers
+- [ ] Terraform: `terraform apply` provisions full cluster via `wenzel-felix/rke2/hcloud` module
+- [ ] hcloud-ccm + hcloud-csi installed (LoadBalancer service type + persistent volumes)
 - [ ] HashiCorp Vault: provider API keys, tenant secrets, auto-rotation
 - [ ] TLS everywhere: API, internal services, database connections
 - [ ] Auth hardening: API key scoping, request signing, IP allowlisting
-- [ ] Kubernetes manifests: all services deployable to K8s
-- [ ] Helm chart: `helm install hermes ./deploy/helm`
-- [ ] Staging environment: deployed and accessible
+- [ ] Staging environment: deployed on Hetzner, accessible via Hetzner LB
 
 *Weeks 7-8 (Observability + Onboarding):*
 - [ ] Grafana dashboards: ~15 panels covering system and business metrics
@@ -321,7 +322,8 @@ The original implementation plan (2026-02-11) assumed direct carrier connections
 - [ ] Restate evaluation report (if prototyped)
 
 **Exit Criteria:**
-- Production Kubernetes cluster running all services
+- RKE2 cluster running on Hetzner Cloud (Falkenstein) with HA control plane
+- All services deployed via K8s manifests
 - Vault managing all secrets (zero hardcoded credentials)
 - TLS on every connection (internal and external)
 - Grafana dashboards showing real-time system health
@@ -332,7 +334,8 @@ The original implementation plan (2026-02-11) assumed direct carrier connections
 **Risk:**
 | Risk | Probability | Impact | Mitigation |
 |------|-------------|--------|------------|
-| Kubernetes complexity | Medium | 1-week delay | Start with simple manifests; Helm chart for repeatability |
+| RKE2 x509 cert error after CCM install | Medium | 1-day delay | Set `node-ip` to private network IP before CCM install (documented gotcha) |
+| Hetzner CSI volume limitations | Low | Minor | ReadWriteOnce only — acceptable for PG/Redis (single-writer) |
 | Vault operational overhead | Low | Days | Use managed Vault or simple Docker deployment for staging |
 | SES sending limit increase | Medium | Email throughput capped | Request production access in Week 3; start with low volume |
 | Temporal at scale | Medium | Performance unknowns | Load test in staging; tune worker count, history shard count |
@@ -395,7 +398,7 @@ The original implementation plan (2026-02-11) assumed direct carrier connections
 | M3 | Provider integration | End Week 3 | Real SMS + email sent via Twilio + SES sandbox | Dev 2 |
 | M4 | **MVP Demo** | **End Week 4** | **Multi-tenant, 1K msg/sec, cascade fallback** | **All devs** |
 | M5 | Security hardened | End Week 6 | Vault, TLS, auth hardening complete | Dev 1 |
-| M6 | Staging deployed | End Week 6 | K8s cluster running, Helm chart working | Dev 2 |
+| M6 | Staging deployed | End Week 6 | RKE2 cluster running on Hetzner Cloud (Falkenstein), Terraform provisioned | Dev 2 |
 | M7 | Observability live | End Week 7 | Grafana dashboards, alerting rules active | Dev 3 |
 | M8 | **Production v1** | **End Week 8** | **First customer live, monitoring, alerting** | **All devs** |
 | M9 | Carrier-direct eval | Week 9+ | Business decision: pursue or defer | Team + Business |
@@ -458,10 +461,12 @@ IP-WARM                                                        █████�
 
 | Phase | Environment | Monthly Cost | Notes |
 |-------|-------------|-------------|-------|
-| 0-3 (Weeks 1-4) | Local dev (Docker Compose) | ~$0 | All services run locally |
-| 4 (Weeks 5-8) | Staging K8s cluster | ~$500-1,000/mo | Small cluster: 3 nodes, managed K8s |
-| 4 (Weeks 5-8) | Production K8s cluster | ~$2,000-3,000/mo | Production-grade: 3-5 nodes, HA |
-| 5+ (Weeks 9+) | Production at scale | ~$3,000-5,000/mo | Depends on message volume and carrier infra |
+| 0-3 (Weeks 1-4) | Local dev (Docker Compose) | ~€0 | All services run locally |
+| 4 (Weeks 5-6) | Staging: RKE2 on Hetzner Cloud | ~€29-45/mo | 1x CX43 + 1x CX33 + storage + LB at Falkenstein (`fsn1`) |
+| 4 (Weeks 6-8) | Production v1: RKE2 on Hetzner Cloud | ~€121/mo | 3x CX33 (CP) + 2x CPX31 + 1x CCX23 + LB. HA. |
+| 5+ (Weeks 9+) | Production at scale | ~€225-399/mo | Dedicated AX42 (€224) or all-CCX cloud (€399) |
+
+> **Hetzner vs AWS:** Production v1 costs ~€121/month on Hetzner vs ~$1,350/month on AWS — **87% savings.** 20TB traffic included. Germany = GDPR. See `docs/research/hetzner-infrastructure.md`.
 
 ### Provider Costs (Pay-as-you-go)
 
@@ -495,7 +500,7 @@ IP-WARM                                                        █████�
 | R4 | SES sending limit increase delay | Weeks 4-5 | Email throughput capped | Medium | Request production access in Week 2; start with low volume; SES scales gradually. |
 | R5 | Load test reveals bottleneck | Week 4 | 1-2 day tuning | Medium | Profile early; both NATS and Temporal proven at much higher throughput. |
 | R6 | Temporal at production scale | Weeks 5-8 | Performance unknowns | Medium | Start with PostgreSQL persistence; plan Cassandra migration if needed. Set `numHistoryShards` correctly (2048+). |
-| R7 | Kubernetes deployment complexity | Weeks 5-6 | 1-week delay | Medium | Start with simple manifests; Claude generates Helm chart; use managed K8s. |
+| R7 | RKE2 on Hetzner setup complexity | Weeks 5-6 | 1-week delay | Low | Terraform module `wenzel-felix/rke2/hcloud` handles provisioning. Critical: set `node-ip` to private IP before CCM install. |
 | R8 | Customer onboarding friction | Weeks 7-8 | Slow adoption | Low | Build sandbox environment; provide SDK examples; Claude generates client libraries. |
 | R9 | Danish telecom registration required | Week 1 (legal) | Blocker if required | Low (for aggregator model) | Evaluate immediately; aggregator-only model may not require registration. |
 | R10 | Analysis paralysis | Any week | Schedule slip | High | This timeline exists to prevent it. Ship MVP in 4 weeks. Decide, don't deliberate. |
@@ -528,10 +533,11 @@ Week 4  ─── GATE 3 ──────────────────�
          Impact of delay: Phase 4 priorities unclear
 
 Week 6  ─── GATE 4 ────────────────────────────────────────────────────────────
-         Decision: Production infrastructure choices
-         Owner: Team
-         Decisions: Cloud provider, region, managed vs self-hosted K8s
-         Impact of delay: Staging/production deployment blocked
+         Decision: Hetzner Cloud vs Dedicated for production
+         Owner: Dev 2 + Team
+         Decisions: Stay on Cloud (CCX nodes) or migrate to AX42 dedicated servers (€49/mo each)?
+         Context: Cloud = flexibility + API-driven. Dedicated = 3x cheaper at stable load.
+         Impact of delay: None (Cloud continues to work, evaluate dedicated at scale)
 
 Week 8  ─── GATE 5 ────────────────────────────────────────────────────────────
          Decision: Carrier-direct — yes / no / later?
